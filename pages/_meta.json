@@ -1,10 +1,10 @@
 {
+  "overview": "Overview",
   "index": "Introduction",
   "another": "Another Page",
   "advanced": "Advanced (A Folder)",
   "about": {
-    "title": "About",
-    "type": "page"
+    "title": "About"
   },
   "contact": {
     "title": "Contact ↗",

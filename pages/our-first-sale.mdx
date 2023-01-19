@@ -1,0 +1,115 @@
+# Our first sale
+
+Before we take a look at building a point-of-sale app for taking IRL payments with Solana Pay, let’s make our app work as a simple e-commerce store: allow users to pay for their cookie order using SOL in their browser wallet. That’ll give us an idea of how Solana transactions work (we’ll see lots more of them later!) and what Solana Pay is doing behind the scenes.
+
+Let’s start by installing some dependencies. These are maintained by Solana and handle wallet connection with a nice UI and React integration:
+
+```sh copy
+npm install @solana/web3.js @solana/wallet-adapter-react @solana/wallet-adapter-react-ui @solana/wallet-adapter-base @solana/wallet-adapter-wallets
+```
+
+Next we need to add code to handle the Solana connection and connected wallet at the top of our component hierarchy, which in Next means in `pages/_app.tsx`. We’re going to use a Solana connection to make requests to the blockchain, and the connected wallet to request the user to make a payment. Update `pages/_app.tsx` to look like:
+
+```tsx filename="pages/_app.tsx" copy
+import "../styles/globals.css";
+import type { AppProps } from "next/app";
+import Layout from "../components/Layout";
+import Head from "next/head";
+import {
+  ConnectionProvider,
+  WalletProvider,
+} from "@solana/wallet-adapter-react";
+import { WalletModalProvider } from "@solana/wallet-adapter-react-ui";
+import { WalletAdapterNetwork } from "@solana/wallet-adapter-base";
+import { clusterApiUrl } from "@solana/web3.js";
+import {
+  PhantomWalletAdapter,
+  SolflareWalletAdapter,
+} from "@solana/wallet-adapter-wallets";
+
+// Default styles that can be overridden by your app
+require("@solana/wallet-adapter-react-ui/styles.css");
+
+function MyApp({ Component, pageProps }: AppProps) {
+  // The network can be set to 'devnet', 'testnet', or 'mainnet-beta'.
+  const network = WalletAdapterNetwork.Devnet;
+
+  // You can also provide a custom RPC endpoint.
+  const endpoint = clusterApiUrl(network);
+
+  // @solana/wallet-adapter-wallets includes all the adapters but supports tree shaking and lazy loading --
+  // Only the wallets you configure here will be compiled into your application, and only the dependencies
+  // of wallets that your users connect to will be loaded.
+  const wallets = [
+    new PhantomWalletAdapter(),
+    new SolflareWalletAdapter({ network }),
+  ];
+
+  return (
+    <ConnectionProvider endpoint={endpoint}>
+      <WalletProvider wallets={wallets} autoConnect>
+        <WalletModalProvider>
+          <Layout>
+            <Head>
+              <title>Cookies Inc</title>
+            </Head>
+            <Component {...pageProps} />
+          </Layout>
+        </WalletModalProvider>
+      </WalletProvider>
+    </ConnectionProvider>
+  );
+}
+
+export default MyApp;
+```
+
+There’s a lot new here! We’re creating a connection to the devnet Solana network. We’re also defining the wallets that we want to allow to connect to our app. Here I’ve used Phantom and Solflare, but there are adapters for loads of wallets so feel free to add any others you like! Once we’ve defined the endpoint and wallets, we wrap our app in some context providers so that we have access to the Solana connection and any connected wallet from every page in our app. This code is pretty much the same in any app using these Solana libraries.
+
+(todo: which wallets? Do we want to include any adapters in a Solana tutorial?)
+
+None of this will immediately change anything about our current app, but it does give us lots of new capabilities. Let’s add the ability to connect a wallet to our home page. Update `pages/index.tsx` to the following:
+
+```tsx filename="pages/index.tsx" copy showLineNumbers {1-2,7-8,14-17,19-20}
+import { useWallet } from "@solana/wallet-adapter-react";
+import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
+import Products from "../components/Products";
+import SiteHeading from "../components/SiteHeading";
+
+export default function HomePage() {
+  // We get the public key of the connected wallet, if there is one
+  const { publicKey } = useWallet();
+
+  return (
+    <div className="flex flex-col gap-8 max-w-4xl items-stretch m-auto pt-24">
+      <SiteHeading>Cookies Inc</SiteHeading>
+
+      {/* We add the Solana wallet connect button */}
+      <div className="basis-1/4">
+        <WalletMultiButton className="!bg-gray-900 hover:scale-105" />
+      </div>
+
+      {/* We disable checking out without a connected wallet */}
+      <Products submitTarget="/checkout" enabled={publicKey !== null} />
+    </div>
+  );
+}
+```
+
+I’ve added comments showing what’s new, and there’s some new imports too from the same libraries we used before.
+
+Now the page should look like this:
+!["Screenshot with Select Wallet button](/our-first-sale/home-with-wallet-button.png)
+
+If you click that “Select Wallet” button then you should see a modal to choose your wallet:
+!["Screenshot of wallet select modal"](/our-first-sale/select-wallet.png)
+
+Click Phantom, and approve the connection. The page should now look like this:
+(todo: how to deal with this? we need to select _some_ wallet for the screenshots)
+!["Screenshot with a wallet selected"](/our-first-sale/wallet-connected.png)
+
+Nice! We can connect the wallet and check out. Our checkout page doesn’t do anything yet so that’s our next job.
+
+(todo: find a nice callout component w/ different colours)
+
+> In reality we’d need to collect more information for an e-commerce purchase, like the buyer’s name and where they want their cookies delivered. Since we’re just using this to understand the Solana structures though, we’re going to skip that here.

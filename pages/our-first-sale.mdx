@@ -110,6 +110,1020 @@ Click Phantom, and approve the connection. The page should now look like this:
 
 Nice! We can connect the wallet and check out. Our checkout page doesn’t do anything yet so that’s our next job.
 
-(todo: find a nice callout component w/ different colours)
+(todo: find a nice callout component w/ different colours. orange/warning style for this one)
 
 > In reality we’d need to collect more information for an e-commerce purchase, like the buyer’s name and where they want their cookies delivered. Since we’re just using this to understand the Solana structures though, we’re going to skip that here.
+
+## Generating the transaction
+
+We could generate the transaction on the frontend, and send it to the user’s wallet. You might’ve seen apps that do this, for example for buying NFTs. But in an e-commerce use case, it makes more sense to use an API route to generate the transaction because that gives us the ability to record expected transactions reliably. Remember that any code we run on the frontend can be modified by the client!
+
+The first thing we need is the shop address. You can create a fresh account in your wallet for this. Make it different from the one you connect to your app with.
+
+We’ll use this in a few different places throughout the tutorial so let’s create a new file `lib/addresses.ts`:
+
+```ts filename="lib/addresses.ts" copy
+import { PublicKey } from "@solana/web3.js";
+
+// Your shop wallet address
+export const shopAddress = new PublicKey("...");
+```
+
+Note that public key is another term we use for address, so we’re just storing the address here in a way that the Solana libraries expect it.
+
+Okay let’s create our API route. Add a new file `pages/api/makeTransaction.ts`. We’re going to use this to generate a transaction for a given checkout, and then we’ll have the frontend request the user to approve that transaction. BTW don’t worry if you don’t understand all of this, I’ll go through it below. Here’s the code for it:
+
+(todo pretty sure some of this is deprecated now! would need to update code + explanation)
+
+```ts filename="pages/api/makeTransaction.ts" copy
+import { WalletAdapterNetwork } from "@solana/wallet-adapter-base";
+import {
+  clusterApiUrl,
+  Connection,
+  PublicKey,
+  Transaction,
+  SystemProgram,
+  LAMPORTS_PER_SOL,
+} from "@solana/web3.js";
+import { NextApiRequest, NextApiResponse } from "next";
+import { shopAddress } from "../../lib/addresses";
+import calculatePrice from "../../lib/calculatePrice";
+
+export type MakeTransactionInputData = {
+  account: string;
+};
+
+export type MakeTransactionOutputData = {
+  transaction: string;
+  message: string;
+};
+
+type ErrorOutput = {
+  error: string;
+};
+
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse<MakeTransactionOutputData | ErrorOutput>
+) {
+  try {
+    // We pass the selected items in the query, calculate the expected cost
+    const amount = calculatePrice(req.query);
+    if (amount.toNumber() === 0) {
+      res.status(400).json({ error: "Can't checkout with charge of 0" });
+      return;
+    }
+
+    // We pass the reference to use in the query
+    const { reference } = req.query;
+    if (!reference) {
+      res.status(400).json({ error: "No reference provided" });
+      return;
+    }
+
+    // We pass the buyer's public key in JSON body
+    const { account } = req.body as MakeTransactionInputData;
+    if (!account) {
+      res.status(400).json({ error: "No account provided" });
+      return;
+    }
+    const buyerPublicKey = new PublicKey(account);
+    const shopPublicKey = shopAddress;
+
+    const network = WalletAdapterNetwork.Devnet;
+    const endpoint = clusterApiUrl(network);
+    const connection = new Connection(endpoint);
+
+    // Get a recent blockhash to include in the transaction
+    const { blockhash } = await connection.getLatestBlockhash("finalized");
+
+    const transaction = new Transaction({
+      recentBlockhash: blockhash,
+      // The buyer pays the transaction fee
+      feePayer: buyerPublicKey,
+    });
+
+    // Create the instruction to send SOL from the buyer to the shop
+    const transferInstruction = SystemProgram.transfer({
+      fromPubkey: buyerPublicKey,
+      lamports: amount.multipliedBy(LAMPORTS_PER_SOL).toNumber(),
+      toPubkey: shopPublicKey,
+    });
+
+    // Add the reference to the instruction as a key
+    // This will mean this transaction is returned when we query for the reference
+    transferInstruction.keys.push({
+      pubkey: new PublicKey(reference),
+      isSigner: false,
+      isWritable: false,
+    });
+
+    // Add the instruction to the transaction
+    transaction.add(transferInstruction);
+
+    // Serialize the transaction and convert to base64 to return it
+    const serializedTransaction = transaction.serialize({
+      // We will need the buyer to sign this transaction after it's returned to them
+      requireAllSignatures: false,
+    });
+    const base64 = serializedTransaction.toString("base64");
+
+    // Insert into database: reference, amount
+
+    // Return the serialized transaction
+    res.status(200).json({
+      transaction: base64,
+      message: "Thanks for your order! 🍪",
+    });
+  } catch (err) {
+    console.error(err);
+
+    res.status(500).json({ error: "error creating transaction" });
+    return;
+  }
+}
+```
+
+The API takes as input a JSON object `{"account": "public-key"}{:json}` and returns:
+
+```json
+{
+  "transaction": "base-64 encoded transaction",
+  "message": "Thanks for your order! 🍪"
+}
+```
+
+It also takes input in the request query:
+
+- The items selected in the form on the home page, for example `?box-of-cookies=2`` if the user has bought 2 boxes of cookies. If you want to see how this looks a bit more, try selecting some products on the home page and checking out. You’ll see the checkout URL looks like: http://localhost:3000/checkout?box-of-cookies=2&basket-of-cookies=1. Currently we’re using those query params in the URL to display the total price on the checkout page, but we’ll also pass them to our API so it can calculate the price to charge too.
+
+- A reference: `const { reference } = req.query{:ts}`. This is a new Solana public key that we’ll generate on the checkout page. I’ll explain that a bit more in a moment.
+
+Let’s take a look in a bit more detail at how our API works and what it’s doing.
+
+```ts filename="pages/api/makeTransaction.ts"
+const network = WalletAdapterNetwork.Devnet;
+const endpoint = clusterApiUrl(network);
+const connection = new Connection(endpoint);
+```
+
+This is the same sort of code we have in \_app.tsx, we’re initializing a connection to Solana’s devnet network.
+
+```ts filename="pages/api/makeTransaction.ts"
+// Get a recent blockhash to include in the transaction
+const { blockhash } = await(connection.getLatestBlockhash("finalized"));
+```
+
+A transaction should only be valid for a short time. We include the latest block seen on the network so far, and the transaction can then be rejected if that is too old.
+
+```ts filename="pages/api/makeTransaction.ts"
+// Get a recent blockhash to include in the transaction
+const { blockhash } = await(connection.getLatestBlockhash("finalized"));
+```
+
+```ts filename="pages/api/makeTransaction.ts"
+const transaction = new Transaction({
+  recentBlockhash: blockhash,
+  // The buyer pays the transaction fee
+  feePayer: buyerPublicKey,
+});
+```
+
+Here we’re creating a new Solana transaction. We’re setting the `recentBlockhash` to that block we just fetched. We’re also setting our buyer as the fee payer for the transaction. This means that the buyer must sign the transaction before it is processed by the network, giving their authority for it to go ahead.
+
+```ts filename="pages/api/makeTransaction.ts"
+// Create the instruction to send SOL from the buyer to the shop
+const transferInstruction = SystemProgram.transfer({
+  fromPubkey: buyerPublicKey,
+  lamports: amount.multipliedBy(LAMPORTS_PER_SOL).toNumber(),
+  toPubkey: shopPublicKey,
+});
+```
+
+A Solana transaction can contain a sequence of instructions, and it’s atomic - they either all succeed or the transaction fails with no changes. In this case, our transaction just has one instruction: send SOL from the buyer to the shop. Note that our store is currently priced in SOL but the transfer instruction expects to be given the number in lamports. There are 1 billion (10^9) lamports in 1 SOL but it’s best to always use the constant `LAMPORTS_PER_SOL` when converting between them.
+
+```ts filename="pages/api/makeTransaction.ts"
+// Add the reference to the instruction as a key
+// This will mean this transaction is returned when we query for the reference
+transferInstruction.keys.push({
+  pubkey: new PublicKey(reference),
+  isSigner: false,
+  isWritable: false,
+});
+
+// Add the instruction to the transaction
+transaction.add(transferInstruction);
+```
+
+Each instruction has a set of keys associated with it. The transaction can be looked up by any of these keys. Each key can be a signer (or not), and writeable (or not). In our case the transfer function is creating an instruction with some default keys:
+
+- The buyer public key: is a signer, because they’re transferring their SOL and must give their authority. Is writeable, because their SOL balance will change
+
+- The shop public key: is writeable, because their SOL balance will change. Is not a signer, they don’t need to give authority to receive SOL
+
+In the code above we’re adding an additional key, the reference. Remember that this is a public key passed as input to our API, unique to the specific checkout session. It doesn’t need to be a signer or writeable, because it’s not involved in the actual transfer of SOL. But by adding it to our instruction, we’re able to look the transaction up using that reference. That will allow our checkout page to detect that a payment has been made!
+
+Once we’ve added the extra key, we add the transfer instruction to the transaction. Our transaction now has one instruction.
+
+```ts filename="pages/api/makeTransaction.ts"
+// Serialize the transaction and convert to base64 to return it
+const serializedTransaction = transaction.serialize({
+  // We will need the buyer to sign this transaction after it's returned to them
+  requireAllSignatures: false,
+});
+const base64 = serializedTransaction.toString("base64");
+```
+
+We serialize the transaction and then convert it to base-64. This will allow us to return it from the API and consume it on the /checkout page. We must pass `requireAllSignatures: false{:ts}` when we serialize it because our transaction requires the buyer’s signature and we don’t have that yet. We’ll request it from their connected wallet on the /checkout page.
+
+(callout orange/warning style)
+
+> One last thing before we move on: In reality you’d want to record this transaction in a database as part of the API call. This would allow us to later validate that the paid transaction is correct. Again because we’re focusing on the Solana structures here I’ve skipped over that in this tutorial.
+
+That was a lot of theory! Let’s update our app so that we can call this API and see the transaction in practice.
+
+## Requesting the transaction
+
+First let’s just make sure that we can call this API and deserialize the returned transaction back.
+
+Update `pages/checkout.tsx` to the following:
+
+```tsx filename="pages/checkout.tsx" copy
+import { useWallet } from "@solana/wallet-adapter-react";
+import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
+import { Keypair, Transaction } from "@solana/web3.js";
+import { useRouter } from "next/router";
+import { useEffect, useMemo, useState } from "react";
+import BackLink from "../components/BackLink";
+import Loading from "../components/Loading";
+import {
+  MakeTransactionInputData,
+  MakeTransactionOutputData,
+} from "./api/makeTransaction";
+
+export default function Checkout() {
+  const router = useRouter();
+  const { publicKey } = useWallet();
+
+  // State to hold API response fields
+  const [transaction, setTransaction] = useState<Transaction | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+
+  // Read the URL query (which includes our chosen products)
+  const searchParams = new URLSearchParams();
+  for (const [key, value] of Object.entries(router.query)) {
+    if (value) {
+      if (Array.isArray(value)) {
+        for (const v of value) {
+          searchParams.append(key, v);
+        }
+      } else {
+        searchParams.append(key, value);
+      }
+    }
+  }
+
+  // Generate the unique reference which will be used for this transaction
+  const reference = useMemo(() => Keypair.generate().publicKey, []);
+
+  // Add it to the params we'll pass to the API
+  searchParams.append("reference", reference.toString());
+
+  // Use our API to fetch the transaction for the selected items
+  async function getTransaction() {
+    if (!publicKey) {
+      return;
+    }
+
+    const body: MakeTransactionInputData = {
+      account: publicKey.toString(),
+    };
+
+    const response = await fetch(
+      `/api/makeTransaction?${searchParams.toString()}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      }
+    );
+
+    const json = (await response.json()) as MakeTransactionOutputData;
+
+    if (response.status !== 200) {
+      console.error(json);
+      return;
+    }
+
+    // Deserialize the transaction from the response
+    const transaction = Transaction.from(
+      Buffer.from(json.transaction, "base64")
+    );
+    setTransaction(transaction);
+    setMessage(json.message);
+    console.log(transaction);
+  }
+
+  useEffect(() => {
+    getTransaction();
+  }, [publicKey]);
+
+  if (!publicKey) {
+    return (
+      <div className="flex flex-col gap-8 items-center">
+        <div>
+          <BackLink href="/">Cancel</BackLink>
+        </div>
+
+        <WalletMultiButton />
+
+        <p>You need to connect your wallet to make transactions</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-8 items-center">
+      <div>
+        <BackLink href="/">Cancel</BackLink>
+      </div>
+
+      <WalletMultiButton />
+
+      {message ? (
+        <p>{message} Please approve the transaction using your wallet</p>
+      ) : (
+        <p>
+          Creating transaction... <Loading />
+        </p>
+      )}
+    </div>
+  );
+}
+```
+
+There's quite a lot new here! Let's step through it
+
+```tsx filename="pages/checkout.tsx"
+const { publicKey } = useWallet();
+```
+
+This just reads the connected wallet from the home page. It’ll be null if there’s no connected wallet.
+
+```tsx filename="pages/checkout.tsx"
+// State to hold API response fields
+const [transaction, setTransaction] = useState<Transaction | null>(null);
+const [message, setMessage] = useState<string | null>(null);
+```
+
+Just some react state. Our API returns a transaction + a message, so we’ll set these from the response when we get it.
+
+```tsx filename="pages/checkout.tsx"
+// Read the URL query (which includes our chosen products)
+const searchParams = new URLSearchParams();
+for (const [key, value] of Object.entries(router.query)) {
+  if (value) {
+    if (Array.isArray(value)) {
+      for (const v of value) {
+        searchParams.append(key, v);
+      }
+    } else {
+      searchParams.append(key, value);
+    }
+  }
+}
+```
+
+Just converting the query params to a URLSearchParams object. This is easier to work with than the type Next gives us for query params. Remember that the selected products are in the query params, and we need to pass them on to our API.
+
+```tsx filename="pages/checkout.tsx"
+// Generate the unique reference which will be used for this transaction
+const reference = useMemo(() => Keypair.generate().publicKey, []);
+
+// Add it to the params we'll pass to the API
+searchParams.append("reference", reference.toString());
+```
+
+This is the reference that we discussed in the API. We generate it on this page, and add it to the params we’re passing in. We’ll be able to use this to detect the transaction shortly.
+
+```tsx filename="pages/checkout.tsx"
+// Use our API to fetch the transaction for the selected items
+async function getTransaction() {
+  if (!publicKey) {
+    return;
+  }
+
+  const body: MakeTransactionInputData = {
+    account: publicKey.toString(),
+  };
+
+  const response = await fetch(
+    `/api/makeTransaction?${searchParams.toString()}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    }
+  );
+
+  const json = (await response.json()) as MakeTransactionOutputData;
+
+  if (response.status !== 200) {
+    console.error(json);
+    return;
+  }
+
+  // Deserialize the transaction from the response
+  const transaction = Transaction.from(Buffer.from(json.transaction, "base64"));
+  setTransaction(transaction);
+  setMessage(json.message);
+  console.log(transaction);
+}
+
+useEffect(() => {
+  getTransaction();
+}, [publicKey]);
+```
+
+We’re making an API call to our `/api/makeTransaction` and passing it our query params + the `account` body. We decode the response from base64 and deserialize it back into a `Transaction` object.
+
+```tsx filename="pages/checkout.tsx"
+if (!publicKey) {
+  return (
+    <div className="flex flex-col gap-8 items-center">
+      <div>
+        <BackLink href="/">Cancel</BackLink>
+      </div>
+
+      <WalletMultiButton />
+
+      <p>You need to connect your wallet to make transactions</p>
+    </div>
+  );
+}
+
+return (
+  <div className="flex flex-col gap-8 items-center">
+    <div>
+      <BackLink href="/">Cancel</BackLink>
+    </div>
+
+    <WalletMultiButton />
+
+    {message ? (
+      <p>{message} Please approve the transaction using your wallet</p>
+    ) : (
+      <p>
+        Creating transaction... <Loading />
+      </p>
+    )}
+  </div>
+);
+```
+
+Our render is a bit more interesting now! First we handle the case where there isn’t a `publicKey` - we can’t create the transaction without that. We just show the wallet connect button and let the user know they’ll need to connect.
+
+Otherwise, we first show a little loading indicator while we fetch the transaction. Once we have it, we show the message returned by the API. If you refresh the page you should see the transaction fetched and logged and the message shown:
+!["Screenshot showing fetched transaction"](/our-first-sale/log-fetched-transaction.png)
+
+## Sending the transaction
+
+Okay nice, we’ve got a transaction from our API! Now let’s update the page to send that to the user’s wallet and ask them to approve it.
+
+First we need to grab a bit more context using hooks:
+
+```tsx filename="pages/checkout.tsx" copy
+// new import: useConnection
+import { useConnection, useWallet } from "@solana/wallet-adapter-react";
+
+export default function Checkout() {
+  const router = useRouter();
+  // new hook to get the connection
+  const { connection } = useConnection();
+  // also get sendTransaction from useWallet
+  const { publicKey, sendTransaction } = useWallet();
+
+// unchanged below here
+```
+
+We’re getting the Solana connection, and we’re also getting `sendTransaction` from the connected wallet. That’s a function that we can use to send a transaction using the connected wallet.
+
+Now after `getTransaction` and its `useEffect` hook, we need to add another function and hook:
+
+```tsx filename="pages/checkout.tsx copy
+// unchanged code before this
+// add after this existing useEffect call
+useEffect(() => {
+  getTransaction();
+}, [publicKey]);
+
+// Send the fetched transaction to the connected wallet
+async function trySendTransaction() {
+  if (!transaction) {
+    return;
+  }
+  try {
+    await sendTransaction(transaction, connection);
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+// Send the transaction once it's fetched
+useEffect(() => {
+  trySendTransaction();
+}, [transaction]);
+
+// render code unchanged
+```
+
+It can be a bit confusing slotting new code in like this, if you get lost here’s the full `pages/checkout.tsx` at this point:
+
+<details>
+<summary>Click to view `pages/checkout.tsx`</summary>
+
+```tsx filename="pages/checkout.tsx" copy
+import { useConnection, useWallet } from "@solana/wallet-adapter-react";
+import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
+import { Keypair, Transaction } from "@solana/web3.js";
+import { useRouter } from "next/router";
+import { useEffect, useMemo, useState } from "react";
+import BackLink from "../components/BackLink";
+import Loading from "../components/Loading";
+import {
+  MakeTransactionInputData,
+  MakeTransactionOutputData,
+} from "./api/makeTransaction";
+
+export default function Checkout() {
+  const router = useRouter();
+  const { connection } = useConnection();
+  const { publicKey, sendTransaction } = useWallet();
+
+  // State to hold API response fields
+  const [transaction, setTransaction] = useState<Transaction | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+
+  // Read the URL query (which includes our chosen products)
+  const searchParams = new URLSearchParams();
+  for (const [key, value] of Object.entries(router.query)) {
+    if (value) {
+      if (Array.isArray(value)) {
+        for (const v of value) {
+          searchParams.append(key, v);
+        }
+      } else {
+        searchParams.append(key, value);
+      }
+    }
+  }
+
+  // Generate the unique reference which will be used for this transaction
+  const reference = useMemo(() => Keypair.generate().publicKey, []);
+
+  // Add it to the params we'll pass to the API
+  searchParams.append("reference", reference.toString());
+
+  // Use our API to fetch the transaction for the selected items
+  async function getTransaction() {
+    if (!publicKey) {
+      return;
+    }
+
+    const body: MakeTransactionInputData = {
+      account: publicKey.toString(),
+    };
+
+    const response = await fetch(
+      `/api/makeTransaction?${searchParams.toString()}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      }
+    );
+
+    const json = (await response.json()) as MakeTransactionOutputData;
+
+    if (response.status !== 200) {
+      console.error(json);
+      return;
+    }
+
+    // Deserialize the transaction from the response
+    const transaction = Transaction.from(
+      Buffer.from(json.transaction, "base64")
+    );
+    setTransaction(transaction);
+    setMessage(json.message);
+    console.log(transaction);
+  }
+
+  useEffect(() => {
+    getTransaction();
+  }, [publicKey]);
+
+  // Send the fetched transaction to the connected wallet
+  async function trySendTransaction() {
+    if (!transaction) {
+      return;
+    }
+    try {
+      await sendTransaction(transaction, connection);
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  // Send the transaction once it's fetched
+  useEffect(() => {
+    trySendTransaction();
+  }, [transaction]);
+
+  if (!publicKey) {
+    return (
+      <div className="flex flex-col gap-8 items-center">
+        <div>
+          <BackLink href="/buy">Cancel</BackLink>
+        </div>
+
+        <WalletMultiButton />
+
+        <p>You need to connect your wallet to make transactions</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-8 items-center">
+      <div>
+        <BackLink href="/buy">Cancel</BackLink>
+      </div>
+
+      <WalletMultiButton />
+
+      {message ? (
+        <p>{message} Please approve the transaction using your wallet</p>
+      ) : (
+        <p>
+          Creating transaction... <Loading />
+        </p>
+      )}
+    </div>
+  );
+}
+```
+
+</details>
+
+When the `transaction` state gets updated (which we do when we call `setTransaction`) we send that transaction to the user’s wallet using `sendTransaction`.
+
+If you refresh the checkout page now then Phantom should prompt you to approve the transaction:
+!["Screenshot showing Approve Transaction in wallet](/our-first-sale/approve-transaction.png)
+
+BTW when that first opens it might say something like “Transaction may fail to confirm” or show a loader before it shows the SOL price. That’s normal! What’s actually happening there is that the wallet is simulating the transaction so that it can advise you what will happen if you approve it - in this case that you’ll be charged 0.05 SOL. It also might say that if you leave the transaction unapproved for a while. That’s because of the recent blockhash that we talked about before, the transaction becomes stale and will need to be generated again.
+
+If you approve it though, then you’ll send your first Solana transaction! Sweet!
+
+Our UI won’t know that you’ve paid yet, so nothing will happen there. That’s our next job! But if you check your account in your wallet you’ll see the transaction there:
+
+!["Screenshot showing wallet with the transaction displayed"](/our-first-sale/wallet-transaction.png)
+
+And that’s all we have to do to send a transaction!
+
+## Detecting payment
+
+The UX so far is a bit limited, once we present the transaction the user has to go and check their own wallet to see that they’ve paid. We can do way better than that!
+
+Technically we can do this without Solana Pay, but it has a super handy function that’ll make it really straightforward. So let’s install it now:
+
+(todo probably need to bump this version!)
+
+```sh copy
+npm install @solana/pay@0.2.0
+```
+
+We version this dependency just to make sure the APIs used in this tutorial don’t change before we get a chance to update it.
+
+We’re going to add one more `useEffect` to our `pages/checkout.tsx`:
+
+```tsx filename="pages/checkout.tsx"
+// New import
+import { findReference, FindReferenceError } from "@solana/pay";
+
+// unchanged code before this
+// Send the transaction once it's fetched
+useEffect(() => {
+  trySendTransaction()
+}, [transaction])
+
+// Check every 0.5s if the transaction is completed
+useEffect(() => {
+  const interval = setInterval(async () => {
+    try {
+      // Check if there is any transaction for the reference
+      const signatureInfo = await findReference(connection, reference);
+      console.log('They paid!!!')
+    } catch (e) {
+      if (e instanceof FindReferenceError) {
+        // No transaction found yet, ignore this error
+        return;
+      }
+      console.error('Unknown error', e)
+    }
+  }, 500)
+  return () => {
+    clearInterval(interval)
+  }
+}, [])
+
+// render code unchanged
+if (!publicKey) {
+  return (
+    ...
+```
+
+Again if you need it then here's the full file at this point:
+
+<details>
+<summary>Click to view `pages/checkout.tsx`</summary>
+
+```tsx filename="pages/checkout.tsx" copy
+import { useConnection, useWallet } from "@solana/wallet-adapter-react";
+import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
+import { Keypair, Transaction } from "@solana/web3.js";
+import { findReference, FindReferenceError } from "@solana/pay";
+import { useRouter } from "next/router";
+import { useEffect, useMemo, useState } from "react";
+import BackLink from "../components/BackLink";
+import Loading from "../components/Loading";
+import {
+  MakeTransactionInputData,
+  MakeTransactionOutputData,
+} from "./api/makeTransaction";
+
+export default function Checkout() {
+  const router = useRouter();
+  const { connection } = useConnection();
+  const { publicKey, sendTransaction } = useWallet();
+
+  // State to hold API response fields
+  const [transaction, setTransaction] = useState<Transaction | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+
+  // Read the URL query (which includes our chosen products)
+  const searchParams = new URLSearchParams();
+  for (const [key, value] of Object.entries(router.query)) {
+    if (value) {
+      if (Array.isArray(value)) {
+        for (const v of value) {
+          searchParams.append(key, v);
+        }
+      } else {
+        searchParams.append(key, value);
+      }
+    }
+  }
+
+  // Generate the unique reference which will be used for this transaction
+  const reference = useMemo(() => Keypair.generate().publicKey, []);
+
+  // Add it to the params we'll pass to the API
+  searchParams.append("reference", reference.toString());
+
+  // Use our API to fetch the transaction for the selected items
+  async function getTransaction() {
+    if (!publicKey) {
+      return;
+    }
+
+    const body: MakeTransactionInputData = {
+      account: publicKey.toString(),
+    };
+
+    const response = await fetch(
+      `/api/makeTransaction?${searchParams.toString()}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      }
+    );
+
+    const json = (await response.json()) as MakeTransactionOutputData;
+
+    if (response.status !== 200) {
+      console.error(json);
+      return;
+    }
+
+    // Deserialize the transaction from the response
+    const transaction = Transaction.from(
+      Buffer.from(json.transaction, "base64")
+    );
+    setTransaction(transaction);
+    setMessage(json.message);
+    console.log(transaction);
+  }
+
+  useEffect(() => {
+    getTransaction();
+  }, [publicKey]);
+
+  // Send the fetched transaction to the connected wallet
+  async function trySendTransaction() {
+    if (!transaction) {
+      return;
+    }
+    try {
+      await sendTransaction(transaction, connection);
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  // Send the transaction once it's fetched
+  useEffect(() => {
+    trySendTransaction();
+  }, [transaction]);
+
+  // Check every 0.5s if the transaction is completed
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      try {
+        // Check if there is any transaction for the reference
+        const signatureInfo = await findReference(connection, reference);
+        console.log("They paid!!!");
+      } catch (e) {
+        if (e instanceof FindReferenceError) {
+          // No transaction found yet, ignore this error
+          return;
+        }
+        console.error("Unknown error", e);
+      }
+    }, 500);
+    return () => {
+      clearInterval(interval);
+    };
+  }, []);
+
+  if (!publicKey) {
+    return (
+      <div className="flex flex-col items-center gap-8">
+        <div>
+          <BackLink href="/">Cancel</BackLink>
+        </div>
+
+        <WalletMultiButton />
+
+        <p>You need to connect your wallet to make transactions</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col items-center gap-8">
+      <div>
+        <BackLink href="/">Cancel</BackLink>
+      </div>
+
+      <WalletMultiButton />
+
+      {message ? (
+        <p>{message} Please approve the transaction using your wallet</p>
+      ) : (
+        <p>
+          Creating transaction... <Loading />
+        </p>
+      )}
+    </div>
+  );
+}
+```
+
+</details>
+
+We’ve added an interval that checks every 0.5s to see if there is any transaction using our reference. If there isn’t then `findReference` will throw a `FindReferenceError` which we catch and ignore. So now our checkout page will just keep polling in the background to see if the user has paid.
+
+(callout: orange/warning style)
+
+> The call to findReference will find any transaction using our reference, which is not secret. It doesn’t guarantee that the correct transaction has been made. In this case, it’s OK because we’re just showing feedback to the user. Later in the tutorial, we’ll see ways to improve the security here.
+
+If you refresh and approve the transaction, you should see a log message indicating that it’s paid:
+
+!["Screenshot of browser console showing transaction paid messages"](/our-first-sale/transaction-paid-log.png)
+
+Now we just need to let the user know that we’ve received their payment!
+
+## Adding a `/confirmed` page
+
+We’re going to add a new page to tell the user that their payment has been accepted.
+
+I’m going to show you how I built mine, but if you’d like to do something else then feel free! Your app 🙂
+
+First there’s one new dependency:
+
+```sh copy
+npm install react-circular-progressbar
+```
+
+This lets us animate a circular progress bar, which I think looks really nice! It comes with a bit of state for the animation, so we’ll put it in its own component:
+
+```tsx filename="components/Confirmed.tsx" copy
+import { useEffect, useState } from "react";
+import { buildStyles, CircularProgressbar } from "react-circular-progressbar";
+import "react-circular-progressbar/dist/styles.css";
+
+export default function Confirmed() {
+  const [percentage, setPercentage] = useState(0);
+  const [text, setText] = useState("🍪");
+
+  useEffect(() => {
+    const t1 = setTimeout(() => setPercentage(100), 100);
+    const t2 = setTimeout(() => setText("✅"), 600);
+
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+    };
+  }, []);
+
+  return (
+    <CircularProgressbar
+      value={percentage}
+      text={text}
+      styles={buildStyles({
+        pathColor: "#00BA00",
+      })}
+    />
+  );
+}
+```
+
+The progress bar library has animation built in, but it only animates on state changes - so if we just create a progress bar with 100% progress then it won’t animate. And the animation is nice! So we create it with 0% and then animate it to 100% after 100ms.
+
+(snipped the playground to modify this)
+
+And let's add a page to display that component:
+
+```tsx filename="pages/confirmed.tsx copy
+import BackLink from "../components/BackLink";
+import Confirmed from "../components/Confirmed";
+import PageHeading from "../components/PageHeading";
+
+export default function ConfirmedPage() {
+  return (
+    <div className="flex flex-col gap-8 items-center">
+      <BackLink href="/">Home</BackLink>
+
+      <PageHeading>Thankyou, enjoy your cookies!</PageHeading>
+
+      <div className="h-80 w-80">
+        <Confirmed />
+      </div>
+    </div>
+  );
+}
+```
+
+And finally, we can update the `useEffect` in our checkout page to redirect to this page as soon as we see the payment!
+
+```tsx filename="pages/checkout.tsx" {7}
+// Check every 0.5s if the transaction is completed
+useEffect(() => {
+  const interval = setInterval(async () => {
+    try {
+      // Check if there is any transaction for the reference
+      const signatureInfo = await findReference(connection, reference);
+      router.push("/confirmed");
+    } catch (e) {
+      if (e instanceof FindReferenceError) {
+        // No transaction found yet, ignore this error
+        return;
+      }
+      console.error("Unknown error", e);
+    }
+  }, 500);
+  return () => {
+    clearInterval(interval);
+  };
+}, []);
+```
+
+I've just replaced the `console.log` line with `router.push('/confirmed')`.
+
+And now when we receive a valid payment we’ll display the new confirmed screen:
+
+!["Animated GIF showing the redirect to the /confirmed page"](/our-first-sale/redirect-to-confirmed.gif)
+
+At this point we can sell cookies on our site using Solana!
+
+But lots of people coming into our cookie shop might not know what the value of a SOL is. It’d be nice if we could charge them in dollars instead! That’s what we’ll explore in the next lesson.
